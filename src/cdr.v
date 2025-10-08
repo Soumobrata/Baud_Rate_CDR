@@ -1,8 +1,10 @@
 // -----------------------------------------------------------------------------
 // cdr.v — Baud-rate CDR (PAM4) per your block diagram (TT-friendly)
-// DATA(8) → DFF → X(8) → Quantizer → S(4) → DELAY_S → S1(4)
-// X(8) → DELAY_X → X1(8) → MMPD → PHI(16) → Filter(PI 32) → DCO → Sample_en
-// Notes: no multipliers; trimmed internal widths to fit 1×1 better.
+// DATA(1) → counter(256-UI span) → X(8) → Quantizer → S(4) → DELAY_S → S1(4)
+// X(8)    → DELAY_X → X1(8) → MMPD(shift/add) → PHI(16) → Filter(PI 24b int) → DCO → Sample_en
+// Notes:  - no multipliers (MMPD uses shifts/adds)
+//         - trimmed widths for tiny tool runs (PHASE_BITS=24)
+//         - Sample_en ≈ 25 MHz (UI ≈ 40 ns @ 50 MHz clk)
 // -----------------------------------------------------------------------------
 `timescale 1ps/1ps
 `default_nettype none
@@ -10,9 +12,9 @@
 module cdr (
   input  wire               clk,        // 50 MHz system clock
   input  wire               rst_n,
-  input  wire signed [7:0]  DATA,       // input data stream
+  input  wire               DATA,       // 1-bit VCO clock (<= 25 MHz)
   output wire               Sample_en,  // symbol strobe (1-cycle pulse)
-  output wire signed [7:0]  X,          // sampled data
+  output wire signed [7:0]  X,          // counted/centered sample
   output wire signed [3:0]  S,          // quantized symbol (-3,-1,+1,+3)
   output wire signed [7:0]  X1,         // delayed X
   output wire signed [3:0]  S1,         // delayed S
@@ -21,24 +23,36 @@ module cdr (
 );
 
   // ================= configuration =================
-  localparam integer PHASE_BITS         = 24;               // trimmed from 32
-  localparam [PHASE_BITS-1:0] FCW_NOM   = 24'h80_0000;      // ≈ UI = 2 clks
+  localparam integer PHASE_BITS         = 24;           // trimmed from 32
+  localparam [PHASE_BITS-1:0] FCW_NOM   = 24'h80_0000;  // ≈ UI = 2 clks → ~25 MHz
   localparam integer KP_SHIFT           = 12;
   localparam integer KI_SHIFT           = 18;
-  localparam integer DFCW_SHIFT         = 27;               // was 29; small tweak
+  localparam integer DFCW_SHIFT         = 27;           // phase-only control
   localparam [PHASE_BITS-1:0] DFCW_STEP = (FCW_NOM >> 10);
-  localparam signed  [PHASE_BITS:0] DFCW_CLAMP  =
-      $signed({1'b0, DFCW_STEP}); // ±step in PHASE_BITS domain
+  localparam signed  [PHASE_BITS:0] DFCW_CLAMP =
+      $signed({1'b0, DFCW_STEP});                       // ±step in PHASE_BITS domain
+
+  localparam integer CNTR_BITS          = 14;           // free-run VCO counter width
 
   wire rst = ~rst_n;
 
-  // ================= D Flip-Flop (Sampler) =================
-  DFF u_dff (
-    .clk(clk),
-    .en (Sample_en),   // sample at symbol strobe
-    .rst(rst),
-    .D  (DATA),
-    .Q  (X)
+  // ================= Counter front-end (spans 256 UIs) =================
+  // For DATA ∈ {10,15,20,25} MHz and UI=25 MHz:
+  // span counts ≈ {102,154,206,256}; center near mid (~180).
+  reg [CNTR_BITS-1:0] N0_reg = 14'd180;
+
+  counter #(
+    .W(8),
+    .CNTR_BITS(CNTR_BITS),
+    .GAIN_SHIFT(0),      // no extra scaling; wide X swing (≈ ±80)
+    .SPAN_UIS(256)
+  ) u_counter (
+    .clk      (clk),
+    .rst      (rst),
+    .Sample_en(Sample_en),
+    .DATA     (DATA),
+    .N0       (N0_reg),
+    .Q        (X)
   );
 
   // ================= Quantizer (PAM4) =================
@@ -85,21 +99,79 @@ module cdr (
 
 endmodule
 
+
 // -----------------------------------------------------------------------------
-// DFF — D Flip-Flop (Sampler)
+// counter — VCO-edge counter with multi-UI span (CDC + Gray)
+// Counts edges of 1-bit DATA (async VCO clock). Each UI, outputs the
+// number of edges accumulated over the last SPAN_UIS UIs, centered by N0,
+// then scaled to W-bit signed Q.
 // -----------------------------------------------------------------------------
-module DFF (
-  input  wire              clk,
-  input  wire              en,
-  input  wire              rst,
-  input  wire signed [7:0] D,
-  output reg  signed [7:0] Q
+module counter #(
+  parameter integer W          = 8,
+  parameter integer CNTR_BITS  = 14,  // free-running edge counter width
+  parameter integer GAIN_SHIFT = 0,   // coarse right shift
+  parameter integer SPAN_UIS   = 256  // number of UIs to span
+)(
+  input  wire              clk,         // CDR clock domain
+  input  wire              rst,         // sync to clk
+  input  wire              Sample_en,   // 1-cycle strobe (~25 MHz)
+  input  wire              DATA,        // async VCO clock (≤ 25 MHz)
+  input  wire [CNTR_BITS-1:0] N0,       // nominal span count (centering)
+  output reg  signed [W-1:0] Q
 );
+  // VCO domain: free-running binary counter
+  reg [CNTR_BITS-1:0] vco_bin = {CNTR_BITS{1'b0}};
+  always @(posedge DATA) vco_bin <= vco_bin + 1'b1;
+
+  // Binary → Gray
+  wire [CNTR_BITS-1:0] vco_gray = vco_bin ^ (vco_bin >> 1);
+
+  // 2-FF sync of Gray into clk domain
+  reg [CNTR_BITS-1:0] g1, g2;
   always @(posedge clk) begin
-    if (rst)      Q <= 8'sd0;
-    else if (en)  Q <= D;
+    if (rst) begin g1 <= {CNTR_BITS{1'b0}}; g2 <= {CNTR_BITS{1'b0}}; end
+    else begin g1 <= vco_gray; g2 <= g1; end
+  end
+
+  // Gray → Binary
+  function [CNTR_BITS-1:0] gray2bin(input [CNTR_BITS-1:0] g);
+    integer i; begin
+      gray2bin[CNTR_BITS-1] = g[CNTR_BITS-1];
+      for (i = CNTR_BITS-2; i >= 0; i = i - 1)
+        gray2bin[i] = gray2bin[i+1] ^ g[i];
+    end
+  endfunction
+  wire [CNTR_BITS-1:0] bin_now = gray2bin(g2);
+
+  // Snapshot from SPAN_UIS UIs ago (simple shift-register history)
+  reg [CNTR_BITS-1:0] hist [0:SPAN_UIS-1];
+  integer k;
+
+  // diff over K UIs = bin_now - bin_{now-K}
+  wire [CNTR_BITS:0] diff_span =
+      {1'b0,bin_now} - {1'b0,hist[SPAN_UIS-1]}; // assume no wrap over span
+
+  // Center & scale to W-bit signed
+  wire signed [CNTR_BITS:0] centered = $signed({1'b0,diff_span[CNTR_BITS-1:0]}) - $signed({1'b0,N0});
+  wire signed [CNTR_BITS:0] scaled   = centered >>> GAIN_SHIFT;
+
+  always @(posedge clk) begin
+    if (rst) begin
+      for (k = 0; k < SPAN_UIS; k = k + 1) hist[k] <= {CNTR_BITS{1'b0}};
+      Q <= {W{1'b0}};
+    end else if (Sample_en) begin
+      // shift history & capture
+      for (k = SPAN_UIS-1; k > 0; k = k - 1) hist[k] <= hist[k-1];
+      hist[0] <= bin_now;
+
+      // saturate to W bits
+      if      (scaled >  $signed({1'b0,{(W-1){1'b1}}})) Q <=  {1'b0,{(W-1){1'b1}}};
+      else if (scaled <  $signed({1'b1,{(W-1){1'b0}}})) Q <=  {1'b1,{(W-1){1'b0}}};
+      else                                              Q <=  scaled[W-1:0];
+    end
   end
 endmodule
+
 
 // -----------------------------------------------------------------------------
 // Quantizer — PAM4 hard decision slicer
@@ -115,6 +187,7 @@ module Quantizer (
     else              S =  4'sd3;
   end
 endmodule
+
 
 // -----------------------------------------------------------------------------
 // Separate Delay Cells for X (8-bit) and S (4-bit)
@@ -149,6 +222,7 @@ module DELAY_S #(
   end
 endmodule
 
+
 // -----------------------------------------------------------------------------
 // MMPD — Multilevel Mueller–Müller Phase Detector (shift-add only)
 // PHI = S[n]*X[n-1] - S[n-1]*X[n], with S ∈ {−3, −1, +1, +3}
@@ -160,7 +234,7 @@ module MMPD (
   input  wire signed [3:0]  S1,
   output wire signed [15:0] PHI
 );
-  // sign-extend to 16b once
+  // sign-extend once
   wire signed [15:0] X16   = {{8{X[7]}},  X};
   wire signed [15:0] X1_16 = {{8{X1[7]}}, X1};
 
@@ -183,10 +257,10 @@ module MMPD (
   assign PHI = a - b;
 endmodule
 
+
 // -----------------------------------------------------------------------------
 // Filter — PI controller (digital loop filter)
 // Internals use 24 bits; output port remains 32 bits (sign-extended).
-// Icarus-friendly: no slice-after-shift.
 // -----------------------------------------------------------------------------
 module Filter #(
   parameter integer KP_SHIFT = 12,
@@ -202,13 +276,11 @@ module Filter #(
 
   reg  signed [ACC_BITS-1:0] acc;                // 24-bit integrator
 
-  // Sign-extend PHI to 32b, then shift into a temp before slicing (Icarus-safe)
-  wire signed [31:0] phi32          = {{16{PHI[15]}}, PHI};
-  wire signed [31:0] phi32_shifted  = phi32 >>> KP_SHIFT;
-  wire signed [ACC_BITS-1:0] p24    = phi32_shifted[ACC_BITS-1:0];
+  wire signed [31:0] phi32         = {{16{PHI[15]}}, PHI};
+  wire signed [31:0] phi32_shifted = phi32 >>> KP_SHIFT;
+  wire signed [ACC_BITS-1:0] p24   = phi32_shifted[ACC_BITS-1:0];
 
-  // Same idea: ensure the RHS is a wire/reg before slicing or mixing widths
-  wire signed [ACC_BITS-1:0] i24    = ($signed(acc) >>> KI_SHIFT);
+  wire signed [ACC_BITS-1:0] i24   = ($signed(acc) >>> KI_SHIFT);
   wire signed [ACC_BITS-1:0] pi24_prev = PI[ACC_BITS-1:0];
   wire signed [ACC_BITS-1:0] pi24_next = pi24_prev + p24 + i24;
 
@@ -217,13 +289,12 @@ module Filter #(
       acc <= '0;
       PI  <= 32'sd0;
     end else if (en) begin
-      // integrate PHI (sign-extend to 24b first)
-      acc <= acc + {{(ACC_BITS-16){PHI[15]}}, PHI};
-      // Sign-extend 24b internal PI to 32b output port
-      PI  <= {{(32-ACC_BITS){pi24_next[ACC_BITS-1]}}, pi24_next};
+      acc <= acc + {{(ACC_BITS-16){PHI[15]}}, PHI};  // integrate PHI
+      PI  <= {{(32-ACC_BITS){pi24_next[ACC_BITS-1]}}, pi24_next}; // sign-extend
     end
   end
 endmodule
+
 
 // -----------------------------------------------------------------------------
 // DCO — digital controlled oscillator (tick-on-wrap type), param PHASE_BITS
