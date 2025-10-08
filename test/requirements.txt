@@ -1,2 +1,2 @@
 pytest==8.4.2
-pip install --upgrade cocotb
+cocotb==1.7.2
