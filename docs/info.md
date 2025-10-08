@@ -1,20 +1,19 @@
-<!---
+# Baud-Rate PAM4 Clock and Data Recovery (CDR)
 
-This file is used to generate your project datasheet. Please fill in the information below and delete any unused
-sections.
+**Author:** Soumobrata Ghosh  
+**Project type:** Mixed-signal digital CDR core implemented fully in synthesizable Verilog  
+**Clock:** 50 MHz  
+**Tile size:** 1 × 1  
 
-You can also include images in this folder and reference them in the markdown. Each image must be less than
-512 kb in size, and the combined size of all images must be less than 1 MB.
--->
+---
 
-## How it works
+## Overview
 
-Explain how your project works
+This design implements a baud-rate PAM4 Clock-and-Data-Recovery (CDR)** architecture entirely in digital logic.  
+It follows a classical Mueller–Müller phase detector (MMPD) structure with a proportional-integral (PI) loop filter and a digitally controlled oscillator (DCO) that generates a symbol-rate strobe.
 
-## How to test
+The core tracks the phase of a four-level (PAM-4) input data stream and aligns its internal sampling instant to incoming data transitions — a technique used in **high-speed SerDes, Ethernet, and memory interface receivers.
 
-Explain how to use your project
+---
 
-## External hardware
 
-List external hardware used in your project (e.g. PMOD, LED display, etc), if any
