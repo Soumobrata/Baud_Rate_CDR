@@ -46,7 +46,7 @@ module tt_um_baud_rate_cdr (
 
   // Register uo_out so top is unquestionably sequential for ABC
   reg [7:0] uo_q;
-  always @(posedge clk or negedge rst_n) begin
+  always @(posedge clk) begin
     if (!rst_n || !ena) uo_q <= 8'h00;
     else                uo_q <= {Sample_en, S[2:0], X[7:4]};
   end
