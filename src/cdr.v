@@ -186,6 +186,7 @@ endmodule
 // -----------------------------------------------------------------------------
 // Filter — PI controller (digital loop filter)
 // Internals use 24 bits; output port remains 32 bits (sign-extended).
+// Icarus-friendly: no slice-after-shift.
 // -----------------------------------------------------------------------------
 module Filter #(
   parameter integer KP_SHIFT = 12,
@@ -199,19 +200,26 @@ module Filter #(
 );
   localparam integer ACC_BITS = 24;
 
-  reg  signed [ACC_BITS-1:0] acc;        // 24-bit integrator
-  wire signed [31:0] phi32 = {{16{PHI[15]}}, PHI};
-  wire signed [ACC_BITS-1:0] p24 = (phi32 >>> KP_SHIFT)[ACC_BITS-1:0];
-  wire signed [ACC_BITS-1:0] i24 = acc >>> KI_SHIFT;
-  wire signed [ACC_BITS-1:0] pi24_next = (PI[ACC_BITS-1:0]) + p24 + i24;
+  reg  signed [ACC_BITS-1:0] acc;                // 24-bit integrator
+
+  // Sign-extend PHI to 32b, then shift into a temp before slicing (Icarus-safe)
+  wire signed [31:0] phi32          = {{16{PHI[15]}}, PHI};
+  wire signed [31:0] phi32_shifted  = phi32 >>> KP_SHIFT;
+  wire signed [ACC_BITS-1:0] p24    = phi32_shifted[ACC_BITS-1:0];
+
+  // Same idea: ensure the RHS is a wire/reg before slicing or mixing widths
+  wire signed [ACC_BITS-1:0] i24    = ($signed(acc) >>> KI_SHIFT);
+  wire signed [ACC_BITS-1:0] pi24_prev = PI[ACC_BITS-1:0];
+  wire signed [ACC_BITS-1:0] pi24_next = pi24_prev + p24 + i24;
 
   always @(posedge clk) begin
     if (rst) begin
       acc <= '0;
       PI  <= 32'sd0;
     end else if (en) begin
-      acc <= acc + {{(ACC_BITS-16){PHI[15]}}, PHI}; // integrate PHI
-      // Sign-extend 24b to 32b for the external PI port
+      // integrate PHI (sign-extend to 24b first)
+      acc <= acc + {{(ACC_BITS-16){PHI[15]}}, PHI};
+      // Sign-extend 24b internal PI to 32b output port
       PI  <= {{(32-ACC_BITS){pi24_next[ACC_BITS-1]}}, pi24_next};
     end
   end
