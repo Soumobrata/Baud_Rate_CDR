@@ -1,8 +1,8 @@
 // -----------------------------------------------------------------------------
-// cdr.v — Baud-rate CDR (PAM4) per your block diagram (TinyTapeout friendly)
+// cdr.v — Baud-rate CDR (PAM4) per your block diagram (TT-friendly)
 // DATA(8) → DFF → X(8) → Quantizer → S(4) → DELAY_S → S1(4)
 // X(8) → DELAY_X → X1(8) → MMPD → PHI(16) → Filter(PI 32) → DCO → Sample_en
-// Notes for TT: no inferred multipliers; all shifts/adds; no initial blocks.
+// Notes: no multipliers; trimmed internal widths to fit 1×1 better.
 // -----------------------------------------------------------------------------
 `timescale 1ps/1ps
 `default_nettype none
@@ -17,18 +17,18 @@ module cdr (
   output wire signed [7:0]  X1,         // delayed X
   output wire signed [3:0]  S1,         // delayed S
   output wire signed [15:0] PHI,        // PD output
-  output wire signed [31:0] PI          // filter output
+  output wire signed [31:0] PI          // filter output (port stays 32b)
 );
 
   // ================= configuration =================
-  localparam integer PHASE_BITS         = 32;
-  // With 50 MHz clk, FCW_NOM = 0x8000_0000 gives Sample_en ≈ 25 MHz (UI = 2 clks)
-  localparam [PHASE_BITS-1:0] FCW_NOM   = 32'h8000_0000;
+  localparam integer PHASE_BITS         = 24;               // trimmed from 32
+  localparam [PHASE_BITS-1:0] FCW_NOM   = 24'h80_0000;      // ≈ UI = 2 clks
   localparam integer KP_SHIFT           = 12;
   localparam integer KI_SHIFT           = 18;
-  localparam integer DFCW_SHIFT         = 29;              // phase-only control
+  localparam integer DFCW_SHIFT         = 27;               // was 29; small tweak
   localparam [PHASE_BITS-1:0] DFCW_STEP = (FCW_NOM >> 10);
-  localparam signed  [31:0] DFCW_CLAMP  = $signed({1'b0, DFCW_STEP});
+  localparam signed  [PHASE_BITS:0] DFCW_CLAMP  =
+      $signed({1'b0, DFCW_STEP}); // ±step in PHASE_BITS domain
 
   wire rst = ~rst_n;
 
@@ -58,27 +58,28 @@ module cdr (
   // ================= Mueller–Müller PD (no multipliers) =================
   MMPD u_mmpd (.X(X), .X1(X1), .S(S), .S1(S1), .PHI(PHI));
 
-  // ================= Loop Filter (PI) =================
-  wire signed [31:0] v_raw;
+  // ================= Loop Filter (PI) — 24b internal, 32b port =================
+  wire signed [31:0] PI_32;
   Filter #(.KP_SHIFT(KP_SHIFT), .KI_SHIFT(KI_SHIFT)) u_pi (
     .clk(clk), .rst(rst), .en(Sample_en),
     .PHI(PHI),
-    .PI (v_raw)
+    .PI (PI_32)
   );
+  assign PI = PI_32;
 
-  // ================= Scale + Clamp =================
-  wire signed [31:0] df_unclamped = $signed(v_raw) >>> DFCW_SHIFT;
-  wire signed [31:0] df_limited =
-      (df_unclamped >  DFCW_CLAMP) ?  DFCW_CLAMP :
-      (df_unclamped < -DFCW_CLAMP) ? -DFCW_CLAMP : df_unclamped;
-
-  assign PI = v_raw;
+  // ================= Scale + Clamp in PHASE_BITS domain =================
+  // Convert PI_32 to small dfcw; clamp to ±DFCW_STEP (PHASE_BITS wide)
+  wire signed [31:0] df_unclamped = $signed(PI_32) >>> DFCW_SHIFT;
+  wire signed [PHASE_BITS-1:0] dfcw_limited =
+      (df_unclamped >  $signed(DFCW_CLAMP)) ?  DFCW_CLAMP[PHASE_BITS-1:0] :
+      (df_unclamped < -$signed(DFCW_CLAMP)) ? -DFCW_CLAMP[PHASE_BITS-1:0] :
+        df_unclamped[PHASE_BITS-1:0];
 
   // ================= DCO =================
   DCO #(.PHASE_BITS(PHASE_BITS)) u_dco (
     .clk(clk), .rst(rst),
     .FCW_NOM(FCW_NOM),
-    .dfcw(df_limited[PHASE_BITS-1:0]),
+    .dfcw(dfcw_limited),
     .Sample_en(Sample_en)
   );
 
@@ -160,10 +161,9 @@ module MMPD (
   output wire signed [15:0] PHI
 );
   // sign-extend to 16b once
-  wire signed [15:0] X16  = {{8{X[7]}},  X};
-  wire signed [15:0] X1_16= {{8{X1[7]}}, X1};
+  wire signed [15:0] X16   = {{8{X[7]}},  X};
+  wire signed [15:0] X1_16 = {{8{X1[7]}}, X1};
 
-  // multiply-by-const (±1, ±3) using shifts/adds
   function automatic signed [15:0] mul_sx;
     input signed [15:0] x;
     input signed [3:0]  s; // -3,-1,+1,+3
@@ -178,13 +178,14 @@ module MMPD (
     end
   endfunction
 
-  wire signed [15:0] a = mul_sx(X1_16, S);   // S[n] * X[n-1]
-  wire signed [15:0] b = mul_sx(X16,  S1);   // S[n-1] * X[n]
+  wire signed [15:0] a = mul_sx(X1_16, S);   // S[n]   * X[n-1]
+  wire signed [15:0] b = mul_sx(X16,   S1);  // S[n-1] * X[n]
   assign PHI = a - b;
 endmodule
 
 // -----------------------------------------------------------------------------
 // Filter — PI controller (digital loop filter)
+// Internals use 24 bits; output port remains 32 bits (sign-extended).
 // -----------------------------------------------------------------------------
 module Filter #(
   parameter integer KP_SHIFT = 12,
@@ -196,26 +197,31 @@ module Filter #(
   input  wire signed [15:0] PHI,
   output reg  signed [31:0] PI
 );
-  reg signed [31:0] acc;
-  wire signed [31:0] p = $signed(PHI) >>> KP_SHIFT;
-  wire signed [31:0] i = acc         >>> KI_SHIFT;
+  localparam integer ACC_BITS = 24;
+
+  reg  signed [ACC_BITS-1:0] acc;        // 24-bit integrator
+  wire signed [31:0] phi32 = {{16{PHI[15]}}, PHI};
+  wire signed [ACC_BITS-1:0] p24 = (phi32 >>> KP_SHIFT)[ACC_BITS-1:0];
+  wire signed [ACC_BITS-1:0] i24 = acc >>> KI_SHIFT;
+  wire signed [ACC_BITS-1:0] pi24_next = (PI[ACC_BITS-1:0]) + p24 + i24;
 
   always @(posedge clk) begin
     if (rst) begin
-      acc <= 32'sd0;
+      acc <= '0;
       PI  <= 32'sd0;
     end else if (en) begin
-      acc <= acc + $signed({{16{PHI[15]}}, PHI});
-      PI  <= PI + p + i;
+      acc <= acc + {{(ACC_BITS-16){PHI[15]}}, PHI}; // integrate PHI
+      // Sign-extend 24b to 32b for the external PI port
+      PI  <= {{(32-ACC_BITS){pi24_next[ACC_BITS-1]}}, pi24_next};
     end
   end
 endmodule
 
 // -----------------------------------------------------------------------------
-// DCO — digital controlled oscillator (tick-on-wrap type)
+// DCO — digital controlled oscillator (tick-on-wrap type), param PHASE_BITS
 // -----------------------------------------------------------------------------
 module DCO #(
-  parameter integer PHASE_BITS = 32
+  parameter integer PHASE_BITS = 24
 )(
   input  wire                         clk,
   input  wire                         rst,
